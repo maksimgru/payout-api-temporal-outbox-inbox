@@ -1,0 +1,225 @@
+x-app-common: &app-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  user: "${UID:-1000}:${GID:-1000}"
+  env_file:
+    - .env
+  volumes:
+    - ./:/var/www/html
+    - ./_volume/composer:/tmp/composer
+
+x-app-runtime-env: &app-runtime-env
+  # Docker-network specific overrides. Business/runtime defaults live in .env.
+  DB_HOST: mysql
+  DB_PORT: 3306
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  PAYMENT_PROVIDER_BASE_URL: http://app:8000/provider
+  TEMPORAL_ADDRESS: temporal:7233
+  APP_WAIT_FOR_DB: "true"
+  COMPOSER_HOME: /tmp/composer
+  XDG_CACHE_HOME: /tmp/composer
+
+services:
+  app:
+    <<: *app-common
+    container_name: payout-app
+    ports:
+      - "${APP_HTTP_PORT:-8080}:8000"
+    environment:
+      <<: *app-runtime-env
+      RUN_MIGRATIONS: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "php -r \"exit(is_resource(@fsockopen('127.0.0.1', 8000)) ? 0 : 1);\""]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+
+  temporal-worker:
+    <<: *app-common
+    container_name: payout-temporal-worker
+    command:
+      - sh
+      - -lc
+      - >
+        until php -r 'exit(is_resource(@fsockopen("temporal", 7233)) ? 0 : 1);';
+        do echo "Waiting for Temporal at temporal:7233..."; sleep 2; done;
+        exec rr serve -c .rr.yaml
+    environment:
+      <<: *app-runtime-env
+      RUN_MIGRATIONS: "false"
+    depends_on:
+      app:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+      temporal-init:
+        condition: service_completed_successfully
+
+  webhook-inbox-worker:
+    <<: *app-common
+    container_name: payout-webhook-inbox-worker
+    command: sh -lc 'while true; do php artisan webhook-inbox:process --limit=50; sleep 2; done'
+    environment:
+      <<: *app-runtime-env
+      RUN_MIGRATIONS: "false"
+    depends_on:
+      app:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  outbox-worker:
+    <<: *app-common
+    container_name: payout-outbox-worker
+    command: sh -lc 'while true; do php artisan outbox:process --limit=50; sleep 2; done'
+    environment:
+      <<: *app-runtime-env
+      RUN_MIGRATIONS: "false"
+    depends_on:
+      app:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Optional fallback worker.
+  # Start it only when PAYOUT_ORCHESTRATION_DRIVER=laravel_queue.
+  # docker compose --profile laravel-queue up -d
+  queue:
+    profiles: ["laravel-queue"]
+    <<: *app-common
+    container_name: payout-queue
+    command: php artisan queue:work redis --queue=default --sleep=1 --tries=8 --timeout=30 --verbose
+    environment:
+      <<: *app-runtime-env
+      PAYOUT_ORCHESTRATION_DRIVER: laravel_queue
+      RUN_MIGRATIONS: "false"
+    depends_on:
+      app:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  mysql:
+    image: mysql:${MYSQL_VERSION:-8.4}
+    container_name: payout-mysql
+    environment:
+      MYSQL_DATABASE: "${DB_DATABASE:-payouts}"
+      MYSQL_USER: "${DB_USERNAME:-payouts}"
+      MYSQL_PASSWORD: "${DB_PASSWORD:-secret}"
+      MYSQL_ROOT_PASSWORD: "${DB_ROOT_PASSWORD:-rootsecret}"
+      MYSQL_ROOT_HOST: "${MYSQL_ROOT_HOST:-%}"
+    ports:
+      - "${MYSQL_HOST_PORT:-3307}:3306"
+    volumes:
+      - ./_volume/mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:${REDIS_VERSION:-7.4-alpine}
+    container_name: payout-redis
+    command: redis-server --appendonly yes
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - ./_volume/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  temporal:
+    image: temporalio/auto-setup:${TEMPORAL_VERSION:-latest}
+    container_name: temporal
+    environment:
+      DB: mysql8
+      DB_PORT: 3306
+      MYSQL_USER: root
+      MYSQL_PWD: "${DB_ROOT_PASSWORD:-rootsecret}"
+      MYSQL_SEEDS: mysql
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CLI_ADDRESS: temporal:7233
+    ports:
+      - "${TEMPORAL_HOST_PORT:-7233}:7233"
+    volumes:
+      - ./temporal/dynamicconfig:/etc/temporal/config/dynamicconfig:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  # One-shot bootstrap service.
+  # It waits for Temporal Server and ensures that the namespace exists.
+  temporal-init:
+    image: temporalio/admin-tools:${TEMPORAL_ADMIN_TOOLS_VERSION:-latest}
+    container_name: temporal-init
+    command:
+      - sh
+      - -lc
+      - >
+        until temporal operator cluster health --address temporal:7233 >/dev/null 2>&1;
+        do echo "Waiting for Temporal cluster health..."; sleep 2; done;
+        until temporal operator namespace describe --address temporal:7233 --namespace "${TEMPORAL_NAMESPACE:-default}" >/dev/null 2>&1;
+        do
+          echo "Ensuring Temporal namespace ${TEMPORAL_NAMESPACE:-default}...";
+          temporal operator namespace create --address temporal:7233 --namespace "${TEMPORAL_NAMESPACE:-default}" --retention "${TEMPORAL_NAMESPACE_RETENTION:-1d}" >/dev/null 2>&1 || true;
+          sleep 2;
+        done;
+        echo "Temporal namespace ${TEMPORAL_NAMESPACE:-default} is ready."
+    depends_on:
+      temporal:
+        condition: service_started
+
+  temporal-ui:
+    image: temporalio/ui:${TEMPORAL_UI_VERSION:-latest}
+    container_name: temporal-ui
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: "${APP_URL:-http://localhost:8080}"
+    ports:
+      - "${TEMPORAL_UI_PORT:-8088}:8080"
+    depends_on:
+      temporal:
+        condition: service_started
+      temporal-init:
+        condition: service_completed_successfully
+
+  # Optional interactive Temporal CLI toolbox.
+  # Start manually:
+  # docker compose --profile tools run --rm temporal-admin-tools sh
+  temporal-admin-tools:
+    profiles: ["tools"]
+    image: temporalio/admin-tools:${TEMPORAL_ADMIN_TOOLS_VERSION:-latest}
+    container_name: temporal-admin-tools
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CLI_ADDRESS: temporal:7233
+    stdin_open: true
+    tty: true
+    depends_on:
+      temporal:
+        condition: service_started

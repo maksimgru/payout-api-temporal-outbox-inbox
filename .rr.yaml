@@ -1,0 +1,21 @@
+version: "3"
+
+rpc:
+  listen: tcp://127.0.0.1:6001
+
+server:
+  command: "php temporal-worker.php"
+
+temporal:
+  address: "${TEMPORAL_ADDRESS}"
+  namespace: "${TEMPORAL_NAMESPACE}"
+  activities:
+    num_workers: 4
+  workflows:
+    num_workers: 4
+
+logs:
+  level: info
+  mode: development
+  encoding: json
+  output: stdout
