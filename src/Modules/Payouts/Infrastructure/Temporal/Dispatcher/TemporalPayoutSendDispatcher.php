@@ -11,6 +11,8 @@ use Shared\Application\Logging\AppLogger;
 use Temporal\Client\GRPC\ServiceClient;
 use Temporal\Client\WorkflowClient;
 use Temporal\Client\WorkflowOptions;
+use Temporal\Exception\Client\ServiceClientException;
+use Temporal\Exception\Client\WorkflowExecutionAlreadyStartedException;
 use Throwable;
 
 final readonly class TemporalPayoutSendDispatcher implements AsyncPayoutSendDispatcher
@@ -43,17 +45,31 @@ final readonly class TemporalPayoutSendDispatcher implements AsyncPayoutSendDisp
                 'payout_id' => $payoutId,
                 'workflow_id' => $workflowId,
             ]);
-        } catch (Throwable $exception) {
-            if (str_contains($exception->getMessage(), 'already')) {
-                $this->logger->warning('Temporal payout workflow already exists; dispatch treated as idempotent.', [
+        } catch (WorkflowExecutionAlreadyStartedException $exception) {
+            $this->logger->info('Temporal payout workflow already exists; dispatch ignored as idempotent.', [
+                'payout_id' => $payoutId,
+                'workflow_id' => $workflowId,
+                'exception' => $exception->getMessage(),
+            ]);
+
+            return;
+        } catch (ServiceClientException $exception) {
+            if (
+                str_contains($exception->getMessage(), 'Workflow execution already') ||
+                str_contains($exception->getMessage(), 'WorkflowExecutionAlreadyStarted') ||
+                str_contains($exception->getMessage(), 'already finished successfully')
+            ) {
+                $this->logger->info('Temporal payout workflow duplicate start rejected; dispatch ignored as idempotent.', [
                     'payout_id' => $payoutId,
                     'workflow_id' => $workflowId,
-                    'error' => $exception->getMessage(),
+                    'exception' => $exception->getMessage(),
                 ]);
 
                 return;
             }
 
+            throw $exception;
+        } catch (Throwable $exception) {
             throw $exception;
         }
     }
