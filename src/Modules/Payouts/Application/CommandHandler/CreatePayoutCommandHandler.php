@@ -7,15 +7,13 @@ use Modules\Payouts\Application\Command\CreatePayoutCommandResult;
 use Modules\Payouts\Application\Dto\PayoutView;
 use Modules\Payouts\Application\Exception\DuplicateExternalReference;
 use Modules\Payouts\Application\Exception\IdempotencyConflict;
-use Modules\Payouts\Application\Port\AsyncPayoutSendDispatcher;
 use Modules\Payouts\Domain\Entity\IdempotencyRecord;
 use Modules\Payouts\Domain\Entity\Payout;
 use Modules\Payouts\Domain\Event\PayoutCreated;
+use Modules\Payouts\Domain\Event\PayoutProviderSendRequested;
 use Modules\Payouts\Domain\Repository\IdempotencyRepository;
 use Modules\Payouts\Domain\Repository\PayoutRepository;
 use Shared\Application\Clock\Clock;
-use Shared\Application\Logging\AppLogger;
-use Shared\Application\Monitoring\MetricsRecorder;
 use Shared\Application\Outbox\OutboxMessage;
 use Shared\Application\Outbox\OutboxRepository;
 use Shared\Application\Transaction\TransactionManager;
@@ -28,11 +26,8 @@ final readonly class CreatePayoutCommandHandler
         private PayoutRepository $payouts,
         private IdempotencyRepository $idempotencyKeys,
         private OutboxRepository $outbox,
-        private AsyncPayoutSendDispatcher $asyncDispatcher,
         private UuidGenerator $uuidGenerator,
         private Clock $clock,
-        private MetricsRecorder $metrics,
-        private AppLogger $logger,
     ) {
     }
 
@@ -40,7 +35,7 @@ final readonly class CreatePayoutCommandHandler
     {
         $hash = $this->hash($command->payload());
 
-        $result = $this->transactions->transactional(function () use ($command, $hash): CreatePayoutCommandResult {
+        return $this->transactions->transactional(function () use ($command, $hash): CreatePayoutCommandResult {
             $existingPayout = $this->findExistingPayoutByIdempotencyKey(
                 idempotencyKey: $command->idempotencyKey,
                 hash: $hash,
@@ -84,6 +79,20 @@ final readonly class CreatePayoutCommandHandler
                 ],
             )));
 
+            $this->outbox->add(OutboxMessage::fromDomainEvent(new PayoutProviderSendRequested(
+                eventId: $this->uuidGenerator->uuid4(),
+                aggregateId: (string) $payout->id,
+                occurredAt: $now,
+                payload: [
+                    'payout_id' => $payout->id,
+                    'user_id' => $payout->userId,
+                    'amount_minor' => $payout->money->amountMinor,
+                    'amount' => $payout->money->toDecimalString(),
+                    'currency' => $payout->money->currency->code,
+                    'external_reference' => $payout->externalReference,
+                ],
+            )));
+
             if ($command->idempotencyKey) {
                 $this->idempotencyKeys->create(new IdempotencyRecord(
                     id: null,
@@ -97,20 +106,6 @@ final readonly class CreatePayoutCommandHandler
 
             return new CreatePayoutCommandResult($view, false);
         }, attempts: 3);
-
-        $createdPayoutId = $result->payout->id;
-
-        if ($createdPayoutId) {
-            $this->asyncDispatcher->dispatchProviderSend($createdPayoutId);
-
-            $this->metrics->increment('payout_create_requests_total', [
-                'currency' => $command->money->currency->code,
-            ]);
-
-            $this->logger->info('Payout provider send workflow dispatched.', ['payout_id' => $createdPayoutId]);
-        }
-
-        return $result;
     }
 
     private function findExistingPayoutByIdempotencyKey(?string $idempotencyKey, string $hash): ?Payout

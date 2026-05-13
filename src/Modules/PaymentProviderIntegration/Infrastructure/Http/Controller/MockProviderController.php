@@ -11,6 +11,12 @@ final class MockProviderController extends Controller
 {
     public function store(Request $request): JsonResponse
     {
+        $idempotencyKey = $request->header('Idempotency-Key');
+
+        if (! is_string($idempotencyKey) || $idempotencyKey === '') {
+            return response()->json(['message' => 'Idempotency-Key header is required.'], 400);
+        }
+
         $request->validate([
             'external_reference' => ['required', 'string', 'max:128'],
             'amount' => ['required', 'regex:/^\d+(\.\d{1,2})?$/'],
@@ -35,7 +41,7 @@ final class MockProviderController extends Controller
             'timeout' => $this->timeoutResponse(),
             'permanent_error' => response()->json(['message' => 'Wallet is invalid'], 422),
             default => response()->json([
-                'provider_payout_id' => 'prov-'.Str::lower(substr(hash('sha256', (string) $request->input('external_reference')), 0, 12)),
+                'provider_payout_id' => 'prov-'.Str::lower(substr(hash('sha256', $idempotencyKey), 0, 12)),
                 'status' => 'accepted',
             ], 202),
         };

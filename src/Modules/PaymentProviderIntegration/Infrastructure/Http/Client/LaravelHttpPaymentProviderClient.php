@@ -19,7 +19,14 @@ final class LaravelHttpPaymentProviderClient implements PaymentProviderClient
             $response = Http::timeout((int) config('services.payment_provider.timeout', 3))
                 ->acceptJson()
                 ->asJson()
-                ->post(rtrim((string) config('services.payment_provider.base_url'), '/').'/payouts', $request->toArray());
+                ->withHeaders([
+                    'Idempotency-Key' => $request->idempotencyKey,
+                    'X-External-Reference' => $request->externalReference,
+                ])
+                ->post(
+                    url: rtrim((string) config('services.payment_provider.base_url'), '/').'/payouts',
+                    data: $request->toArray(),
+                );
         } catch (ConnectionException $exception) {
             throw new PaymentProviderTemporaryFailure(
                 message: 'Provider network error or timeout: '.$exception->getMessage(),

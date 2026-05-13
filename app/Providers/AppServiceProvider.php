@@ -8,6 +8,7 @@ use Modules\Audit\Application\AuditLogWriter;
 use Modules\Audit\Application\EventHandler\AuditDomainEventHandler;
 use Modules\Audit\Infrastructure\Persistence\Doctrine\DoctrineAuditLogWriter;
 use Modules\PaymentProviderIntegration\Infrastructure\Http\Client\LaravelHttpPaymentProviderClient;
+use Modules\Payouts\Application\EventHandler\DispatchPayoutProviderSendRequestedEventHandler;
 use Modules\Payouts\Application\Port\AsyncPayoutSendDispatcher;
 use Modules\Payouts\Application\Port\PaymentProviderClient;
 use Modules\Payouts\Domain\Repository\IdempotencyRepository;
@@ -75,6 +76,7 @@ final class AppServiceProvider extends ServiceProvider
 
         $this->app->singleton(DomainEventDispatcher::class, function ($app): DomainEventDispatcher {
             return new SimpleDomainEventDispatcher([
+                $app->make(DispatchPayoutProviderSendRequestedEventHandler::class),
                 $app->make(AuditDomainEventHandler::class),
                 $app->make(MetricsDomainEventHandler::class),
                 $app->make(DebitUserAccountOnPayoutSucceededEventHandler::class),

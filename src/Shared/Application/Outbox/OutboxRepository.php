@@ -2,14 +2,39 @@
 
 namespace Shared\Application\Outbox;
 
+use DateTimeImmutable;
+use Throwable;
+
 interface OutboxRepository
 {
     public function add(OutboxMessage $message): OutboxMessage;
 
-    /** @return list<OutboxMessage> */
-    public function findPendingForUpdate(int $limit): array;
+    /**
+     * @return list<OutboxMessage>
+     *
+     * @throws Throwable
+     */
+    public function claimAvailable(
+        int $limit,
+        string $workerId,
+        DateTimeImmutable $lockedUntil,
+    ): array;
 
-    public function markProcessed(int $id): void;
+    /**
+     * @throws Throwable
+     */
+    public function markProcessed(
+        int $id,
+        string $workerId,
+    ): void;
 
-    public function markFailed(int $id, string $error, bool $permanent = false): void;
+    /**
+     * @throws Throwable
+     */
+    public function markFailed(
+        int $id,
+        string $workerId,
+        string $error,
+        bool $permanent = false,
+    ): void;
 }
